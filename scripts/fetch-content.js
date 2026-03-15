@@ -176,17 +176,18 @@ async function fetchYouTubeContent(podcasts, state, apiKey, isFirstRun, errors, 
       const limit = isFirstRun ? 2 : 3;
       const videosToProcess = newVideoIds.slice(0, limit);
 
-      // Step 4: For each new video, get metadata first to check publish date,
-      // then fetch transcript only if it's recent enough.
-      // On first run, only include videos from the last 48 hours so users
-      // don't get overwhelmed with 15+ episodes on day one.
+      // Step 4: For each candidate video, get metadata to check publish date.
+      // On first run: prefer videos from the last 48 hours, but if none exist
+      // for this channel, fall back to the single most recent video so the
+      // welcome digest always has something to show.
+      // On regular runs: use the configured lookback window.
       const maxAgeHours = isFirstRun ? 48 : lookbackHours;
       const videoCutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
-      let episodesAdded = 0;
 
+      // First, fetch metadata for all candidates so we can pick the best ones
+      const candidates = [];
       for (const videoId of videosToProcess) {
         try {
-          // Get video metadata (title, author, publish date)
           const metaRes = await fetch(
             `${SUPADATA_BASE}/youtube/video?id=${videoId}`,
             { headers: { 'x-api-key': apiKey } }
@@ -198,30 +199,41 @@ async function fetchYouTubeContent(podcasts, state, apiKey, isFirstRun, errors, 
             title = metaData.title || 'Untitled';
             publishedAt = metaData.uploadDate || metaData.publishedAt || metaData.date || null;
           }
+          candidates.push({ videoId, title, publishedAt });
+          await new Promise(r => setTimeout(r, 300));
+        } catch (err) {
+          errors.push(`Error fetching metadata for video ${videoId}: ${err.message}`);
+        }
+      }
 
-          // Skip videos that are too old
-          if (publishedAt) {
-            const pubDate = new Date(publishedAt);
-            if (pubDate < videoCutoff) {
-              // Mark as processed so we don't check it again next run
-              state.processedVideos[videoId] = Date.now();
-              continue;
-            }
-          }
+      // Filter to recent videos
+      let selectedVideos = candidates.filter(v => {
+        if (!v.publishedAt) return true; // include if no date (can't filter)
+        return new Date(v.publishedAt) >= videoCutoff;
+      });
 
-          // On first run, cap at 1 episode per channel
-          if (isFirstRun && episodesAdded >= 1) break;
+      // On first run: if no videos passed the 48h filter for this channel,
+      // take the single most recent one anyway so the welcome digest isn't empty
+      if (isFirstRun && selectedVideos.length === 0 && candidates.length > 0) {
+        selectedVideos = [candidates[0]]; // first = most recent from Supadata
+      }
 
-          // Get the transcript as plain text
-          // Supadata needs a full YouTube URL, not just the video ID
-          const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      // On first run, cap at 1 episode per channel
+      if (isFirstRun) {
+        selectedVideos = selectedVideos.slice(0, 1);
+      }
+
+      // Now fetch transcripts only for selected videos
+      for (const video of selectedVideos) {
+        try {
+          const videoUrl = `https://www.youtube.com/watch?v=${video.videoId}`;
           const transcriptRes = await fetch(
             `${SUPADATA_BASE}/youtube/transcript?url=${encodeURIComponent(videoUrl)}&text=true`,
             { headers: { 'x-api-key': apiKey } }
           );
 
           if (!transcriptRes.ok) {
-            errors.push(`Failed to fetch transcript for video ${videoId}: HTTP ${transcriptRes.status}`);
+            errors.push(`Failed to fetch transcript for video ${video.videoId}: HTTP ${transcriptRes.status}`);
             continue;
           }
 
@@ -230,23 +242,27 @@ async function fetchYouTubeContent(podcasts, state, apiKey, isFirstRun, errors, 
           results.push({
             source: 'podcast',
             name: podcast.name,
-            title,
-            videoId,
-            url: `https://youtube.com/watch?v=${videoId}`,
-            publishedAt,
+            title: video.title,
+            videoId: video.videoId,
+            url: `https://youtube.com/watch?v=${video.videoId}`,
+            publishedAt: video.publishedAt,
             transcript: transcriptData.content || '',
             language: transcriptData.lang || 'en'
           });
 
-          episodesAdded++;
-
           // Mark as processed
-          state.processedVideos[videoId] = Date.now();
+          state.processedVideos[video.videoId] = Date.now();
 
-          // Small delay between API calls to be respectful
           await new Promise(r => setTimeout(r, 500));
         } catch (err) {
-          errors.push(`Error fetching transcript for video ${videoId}: ${err.message}`);
+          errors.push(`Error fetching transcript for video ${video.videoId}: ${err.message}`);
+        }
+      }
+
+      // Mark skipped candidates as processed so we don't re-check them
+      for (const v of candidates) {
+        if (!state.processedVideos[v.videoId]) {
+          state.processedVideos[v.videoId] = Date.now();
         }
       }
     } catch (err) {
